@@ -43,7 +43,7 @@ class CausalSelfAttention(nn.Module):
         # (Causalty here means that the model can only attend to the past tokens,
         # thats why the mask is applied to the upper triangular part of the matrix,
         # which conforms the already seen tokens)
-        att = att.masked_fill(self.bias[:, :, T, T], float('-inf'))
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         
         #softmax
         att = F.softmax(att, dim=-1)
@@ -81,7 +81,7 @@ class Block(nn.Module):
         """Transformer block"""
         
         self.ln_1 = nn.LayerNorm(config.n_embd)
-        self.attn = nn.CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config)
         self.ln_2 = nn.LayerNorm(config.n_embd)
         self.mlp = MLP(config)
         
@@ -100,7 +100,7 @@ class GPTConfig:
     n_embd: int = 768 #number of hidden units in the transformer blocks
     
 
-class GPT(nn.module):
+class GPT(nn.Module):
     def __init__(self, config):
         super().__init__()
         """Skeleton of the GPT2 model"""
@@ -128,6 +128,28 @@ class GPT(nn.module):
         
         #classification head to predict
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+    
+    def forward(self, idx):
+        #idx to be shaped [B, T] where B is the batch size and T is the sequence length
+        B, T = idx.size()
+        assert T <= self.config.block_size, "Cannot forward sequence length of length {} > block size {}".format(T, self.config.block_size)
+        
+        #forward the token and position embeddings
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device) #shape [T]
+        pos_emb = self.transformer.wpe(pos) #shape [T, n_embd]
+        tok_emb = self.transformer.wte(idx) #shape [B, T, n_embd]
+        x = tok_emb + pos_emb
+        
+        #transformer blocks forwarded
+        for block in self.transformer.h:
+            x = block(x)
+        #final layer normalization
+        x = self.transformer.ln_f(x)
+        
+        #get logits
+        logits = self.lm_head(x) #shape [B, T, vocab_size]
+        return logits #probability distribution over the vocabulary 
+        
         
     @classmethod
     def from_pretrained(cls, model_type):
@@ -157,4 +179,94 @@ class GPT(nn.module):
         sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')]  
         
         #initialize huggingface model
-        model_hf = 
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+        
+        #copy the weights from the pretrained model to the from scratch model
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # ignore the buffer keys
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # ignore these too
+        
+        # basically the openai checkpoints use a "Conv1D" module, but we only want to use a vanilla Linear
+        # this means that we have to transpose these weights when we import them
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        
+        assert len(sd_keys_hf) == len(sd_keys), f"mismatch in number of keys: {len(sd_keys_hf)} != {len(sd_keys)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                #special the weights that need to be transposed
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].T)
+            else:
+                #vanilla copy over the rest of the weights
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k])
+                    
+        return model
+    
+# ------------------------INFERENCE-------------------------------- #
+#autodetect device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+num_return_sequences = 5
+max_length = 30
+
+## model = GPT.from_pretrained('gpt2') #pretrained
+model = GPT(GPTConfig()) #Initialize at random
+model.eval()
+model.to(device)
+
+
+#prefix tokens
+import tiktoken #from openai
+
+#get the encoding for the gpt2 tokenizer
+enc = tiktoken.get_encoding('gpt2')
+
+#encode the input tokens
+tokens = enc.encode("Hello, I'm a language model,")
+
+#convert the tokens to a torch.long tensor
+tokens = torch.tensor(tokens, dtype=torch.long) # (n_tokens,) #in this case 8 tokens
+
+#repeat the tokens for the number of sequences to generate
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (n_sequences, n_tokens) #in this case 5 sequences of 8 tokens
+
+#move the tokens to the GPU
+x = tokens.to(device)
+
+#Now we're all set up to generate some text
+
+#set the seeds for reproducibility
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+#generate the text
+while x.size(1) < max_length:
+    #forward the model to get the logits
+    with torch.no_grad(): #no need to compute gradients
+        logits = model(x) # (B, T, vocab_size) == (n_sequences=5, n_tokens=8, vocab_size=50257)
+        #get the logits for the last token for next token prediction
+        logits = logits[:, -1, :] # (B, vocab_size) == (n_sequences=5, vocab_size=50257)
+        #get the probabilities
+        probs = F.softmax(logits, dim=-1)
+        #do top k sampling to get the next token (in this case of 50 as hf default)
+        #top k probs here would be (5, 50), top k indices would be (5, 50)
+        top_k_probs, top_k_indices = torch.topk(probs, 50, dim=-1)
+        #sample from the top k probs
+        ix = torch.multinomial(top_k_probs, num_samples=1) # (B, 1) == (n_sequences=5, 1)
+        #get the token ids
+        xcol = torch.gather(top_k_indices, -1, ix) # (B, 1) == (n_sequences=5, 1)
+        #concatenate the new token to the input
+        x = torch.cat((x, xcol), dim=1)
+
+
+#print the generated text
+for i in range(num_return_sequences):
+    tokens = x[i, :max_length].tolist()
+    decoded = enc.decode(tokens)
+    print(">", decoded)     
+        
+        
