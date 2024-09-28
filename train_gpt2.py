@@ -40,7 +40,7 @@ class CausalSelfAttention(nn.Module):
         att = (q @ k.transpose(-2, -1)) * (1.0 / (k.size(-1) ** 0.5)) # qk/sqrt(d_k)
         
         #masking the upper triangular part of the matrix for the causality 
-        # (Causalty here means that the model can only attend to the past tokens,
+        # (Causality here means that the model can only attend to the past tokens,
         # thats why the mask is applied to the upper triangular part of the matrix,
         # which conforms the already seen tokens)
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
@@ -86,8 +86,8 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         
     def forward(self, x):
-        x += self.attn(self.ln_1(x))
-        x += self.mlp(self.ln_2(x))
+        x = x + self.attn(self.ln_1(x))
+        x = x + self.mlp(self.ln_2(x))
         return x
     
     
@@ -128,8 +128,11 @@ class GPT(nn.Module):
         
         #classification head to predict
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        
+        #weight sharing scheme for the wte and lm_head weights
+        self.transformer.wte.weight = self.lm_head.weight
     
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         #idx to be shaped [B, T] where B is the batch size and T is the sequence length
         B, T = idx.size()
         assert T <= self.config.block_size, "Cannot forward sequence length of length {} > block size {}".format(T, self.config.block_size)
@@ -145,10 +148,17 @@ class GPT(nn.Module):
             x = block(x)
         #final layer normalization
         x = self.transformer.ln_f(x)
-        
         #get logits
         logits = self.lm_head(x) #shape [B, T, vocab_size]
-        return logits #probability distribution over the vocabulary 
+        
+        #get the loss if targets are provided
+        loss = None
+        if targets is not None:
+            #get loss wrt the targets
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) #cross-entropy loss wrt the targets
+        
+        
+        return logits, loss #probability distribution over the vocabulary, cross-entropy loss
         
         
     @classmethod
@@ -206,24 +216,78 @@ class GPT(nn.Module):
                     
         return model
     
+# ------------------------DATALOADER-------------------------------- #
+import tiktoken #from openai
+
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+        
+        #load the text and store it in memory
+        with open('input.txt', 'r') as f:
+            self.text = f.read()
+        enc = tiktoken.get_encoding('gpt2')
+        #encode the text
+        tokens = enc.encode(self.text)
+        #set the tokens attribute of the class to be a torch tensor of the tokens
+        self.tokens = torch.tensor(tokens)  # (n_tokens,)
+        
+        print(f"Loaded text with {len(self.tokens)} tokens")
+        print(f"1 Epoch = {len(self.tokens) // (B * T)} batches")
+        
+        #state
+        self.current_pos = 0
+    
+    def next_batch(self):
+        B, T = self.B, self.T
+        #get the next batch
+        buf = self.tokens[self.current_pos:self.current_pos + B * T +1]
+        x = buf[:-1].view(B, T) #inputs (B, T)
+        y = buf[1:].view(B, T) #labels (B, T)
+        
+        #move the current position to the next batch
+        self.current_pos += self.B * self.T
+        
+        #if we reach the end of the tokens, reset the current position
+        if self.current_pos + (B*T+1) >= len(self.tokens):
+            self.current_pos = 0
+        
+        return x, y
+
 # ------------------------INFERENCE-------------------------------- #
 #autodetect device
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-num_return_sequences = 5
-max_length = 30
+#train_loader
+train_loader = DataLoaderLite(B=4, T=32) #batch size 4, sequence length 32
 
-## model = GPT.from_pretrained('gpt2') #pretrained
-model = GPT(GPTConfig()) #Initialize at random
-model.eval()
+
+#get logits
+model = GPT(GPTConfig())
 model.to(device)
 
+# ------------------------TRAINING-------------------------------- #
 
-#prefix tokens
-import tiktoken #from openai
+#create the optimizer object which will optimize the model parameters
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4) #we use AdamW optimizer which fixes weight decay in Adam
 
-#get the encoding for the gpt2 tokenizer
-enc = tiktoken.get_encoding('gpt2')
+#set the training loop
+for i in range(100):
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device)
+    #zero the gradients (since pytorch accumulates the gradients)
+    optimizer.zero_grad()
+    #forward the model
+    logits, loss = model(x, y)
+    #backpropagate the loss
+    loss.backward()
+    #optimize the model parameters
+    optimizer.step()
+    #print the loss for monitoring
+    print(f"step {i}, loss {loss.item()}")
+
+import sys; sys.exit(0)
 
 #encode the input tokens
 tokens = enc.encode("Hello, I'm a language model,")
